@@ -21,7 +21,8 @@ from __future__ import print_function
 
 import copy
 import math
-
+import collections
+import re
 # Dependency imports
 
 import numpy as np
@@ -39,6 +40,65 @@ from tensor2tensor.utils import registry
 
 import tensorflow as tf
 from tensorflow.python.framework import dtypes
+
+def get_assignment_map_from_checkpoint(tvars, init_checkpoint):
+  """Compute the union of the current variables and checkpoint variables."""
+  assignment_map = {}
+  initialized_variable_names = {}
+  name_to_variable = collections.OrderedDict()
+  for var in tvars:
+    name = var.name
+    m = re.match("^(.*):\\d+$", name)
+    if m is not None:
+      name = m.group(1)
+    name_to_variable[name] = var
+  init_vars = tf.train.list_variables(init_checkpoint)
+
+  assignment_map = collections.OrderedDict()
+  for x in init_vars:
+    (name, var) = (x[0], x[1])
+    if name not in name_to_variable:
+      #print(name)
+      continue
+    assignment_map[name] = name
+    initialized_variable_names[name] = 1
+    initialized_variable_names[name + ":0"] = 1
+
+  return (assignment_map, initialized_variable_names)
+
+
+def get_assignment_map_from_checkpoint_delib(tvars, init_checkpoint):
+  """Compute the union of the current variables and checkpoint variables."""
+  assignment_map = {}
+  initialized_variable_names = {}
+  name_to_variable = collections.OrderedDict()
+  for var in tvars:
+    name = var.name
+    if 'delib_decoder' not in name:
+        continue
+    m = re.match("^(.*):\\d+$", name)
+    if m is not None:
+      name = m.group(1)
+      name = name.replace('body/delib_decoder/', 'body/decoder/')
+    name_to_variable[name] = var
+  
+  init_vars = tf.train.list_variables(init_checkpoint)
+
+  assignment_map = collections.OrderedDict()
+  for x in init_vars:
+    (name, var) = (x[0], x[1])
+    if name not in name_to_variable:
+      #print(name)
+      continue
+    assignment_map[name] = name.replace('body/decoder/', 'body/delib_decoder/')
+    initialized_variable_names[name] = 1
+    initialized_variable_names[name + ":0"] = 1
+  print(assignment_map)
+  return (assignment_map, initialized_variable_names)
+
+
+
+
 
 
 def model_fn(model,
@@ -78,8 +138,20 @@ def model_fn(model,
   decode_hp = decode_hparams
   # TODO(rsepassi): This still depends on FLAGS. Rm eventually.
   dp = devices.data_parallelism()
-
+ 
   tf.get_variable_scope().set_initializer(_get_variable_initializer(hparams))
+  '''
+  if hparams.init_checkpoint:
+      tvars = tf.trainable_variables()
+      init_checkpoint = hparams.init_checkpoint
+      (assignment_map, initialized_variable_names) = get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+      print('kukuku')
+      print(assignment_map)
+      print(init_checkpoint)
+      print(tvars)
+      #exit()
+      tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+  '''
   is_training = mode == tf.estimator.ModeKeys.TRAIN
 
   # Add input statistics for incoming features.
@@ -179,6 +251,7 @@ def model_fn(model,
         "scores": scores,
         "inputs": features.get("inputs", None),
         "firstP": features.get("firstP", None),
+        "imageP": features.get("imageP", None),
         "targets": features.get("infer_targets", None),
         "problem_choice": batched_problem_choice,
     }
@@ -245,6 +318,19 @@ def model_fn(model,
 
   # Add weight decay and noise.
   total_size, weight_decay_loss = 0, 0.0
+  sess = tf.Session()
+  #JI: uncomment this block for delib to use pre-trained weights from a checkpoint
+  ''' 
+  if hparams.init_checkpoint:
+      tvars = tf.trainable_variables()
+      init_checkpoint = hparams.init_checkpoint
+      (assignment_map, initialized_variable_names) = get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+      #print('kukuku')
+      #print(assignment_map)
+      tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+      #(assignment_map, initialized_variable_names) = get_assignment_map_from_checkpoint_delib(tvars, init_checkpoint)
+      #tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+  '''
   delib_params = None
   if hparams.update_delib_only:
     delib_params = [v for v in tf.trainable_variables() if "delib" in v.name or "softmax" in v.name]

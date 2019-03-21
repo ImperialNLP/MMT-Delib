@@ -38,13 +38,16 @@ from tensor2tensor.utils import t2t_model
 import tensorflow as tf
 
 from tensorflow.python.util import nest
+#JI: set the image dimensionality
+global img_dim
+img_dim = 196
 
 
 @registry.register_model
 class Transformer(t2t_model.T2TModel):
   """Attention net.  See file docstring."""
 
-  def encode(self, inputs, target_space, hparams):
+  def encode(self, inputs, target_space, hparams, imageP=None):
     """Encode transformer inputs.
 
     Args:
@@ -68,8 +71,7 @@ class Transformer(t2t_model.T2TModel):
                                   1.0 - hparams.layer_prepostprocess_dropout)
 
     encoder_output = transformer_encoder(encoder_input, self_attention_bias,
-                                         hparams)
-
+                                         hparams, imageP=imageP)
     return encoder_output, encoder_decoder_attention_bias
 
   def decode(self,
@@ -78,7 +80,7 @@ class Transformer(t2t_model.T2TModel):
              encoder_decoder_attention_bias,
              decoder_self_attention_bias,
              hparams,
-             cache=None):
+             cache=None, imageP=None, imageP_decoder_self_attention_bias=None):
     """Decode Transformer outputs from encoder representation.
 
     Args:
@@ -106,7 +108,7 @@ class Transformer(t2t_model.T2TModel):
         decoder_self_attention_bias,
         encoder_decoder_attention_bias,
         hparams,
-        cache=cache)
+        cache=cache, imageP=imageP, imageP_decoder_self_attention_bias=imageP_decoder_self_attention_bias)
 
     # Expand since t2t expects 4d tensors.
     return tf.expand_dims(decoder_output, axis=2)
@@ -124,24 +126,35 @@ class Transformer(t2t_model.T2TModel):
     Returns:
       Final decoder representation. [batch_size, decoder_length, hidden_dim]
     """
+    #JI: set image shapes
+    imageP = features.get("imageP")
+    imageP.set_shape([None, 1, 19600])
+    imageP=tf.reshape(imageP,[-1, img_dim, 100])
+
     hparams = self._hparams
 
     inputs = features.get("inputs")
     encoder_output, encoder_decoder_attention_bias = (None, None)
     if inputs is not None:
       target_space = features["target_space_id"]
+      # JI: send images to encoder if needed
       encoder_output, encoder_decoder_attention_bias = self.encode(
-          inputs, target_space, hparams)
+          inputs, target_space, hparams,imageP=None)
 
     targets = features["targets"]
     targets = common_layers.flatten4d3d(targets)
 
     decoder_input, decoder_self_attention_bias = transformer_prepare_decoder(
         targets, hparams)
-
+    
+    #JI: compute attention bias for images for decoder
+    img_encoder_padding = common_attention.embedding_to_padding(imageP)
+    imageP_decoder_self_attention_bias = common_attention.attention_bias_ignore_padding(img_encoder_padding)
+    
+    #JI: send images for decoder if needed
     return self.decode(decoder_input, encoder_output,
                        encoder_decoder_attention_bias,
-                       decoder_self_attention_bias, hparams)
+                       decoder_self_attention_bias, hparams, imageP=imageP, imageP_decoder_self_attention_bias=imageP_decoder_self_attention_bias)
 
   def _greedy_infer(self, features, decode_length):
     """Fast version of greedy decoding.
@@ -205,6 +218,11 @@ class Transformer(t2t_model.T2TModel):
     Raises:
       NotImplementedError: If there are multiple data shards.
     """
+    #JI: set images shapes
+    imageP = features["imageP"]
+    imageP.set_shape([None,19600])
+    imageP=tf.reshape(imageP,[-1, img_dim, 100])
+
     if self._num_datashards != 1:
       raise NotImplementedError("Fast decoding only supports a single shard.")
     dp = self._data_parallelism
@@ -229,9 +247,10 @@ class Transformer(t2t_model.T2TModel):
     input_modality = self._problem_hparams.input_modality["inputs"]
     with tf.variable_scope(input_modality.name):
       inputs = input_modality.bottom_sharded(inputs, dp)
+    #JI: send images to encoder if needed
     with tf.variable_scope("body"):
       encoder_output, encoder_decoder_attention_bias = dp(
-          self.encode, inputs, features["target_space_id"], hparams)
+          self.encode, inputs, features["target_space_id"], hparams, imageP=None)
     encoder_output = encoder_output[0]
     encoder_decoder_attention_bias = encoder_decoder_attention_bias[0]
 
@@ -283,9 +302,10 @@ class Transformer(t2t_model.T2TModel):
       bias = decoder_self_attention_bias[:, :, i:i + 1, :i + 1]
 
       with tf.variable_scope("body"):
+        #JI: send images to decoder if needed
         body_outputs = dp(self.decode, targets, cache["encoder_output"],
                           cache["encoder_decoder_attention_bias"], bias,
-                          hparams, cache)
+                          hparams, cache, imageP=cache["imageP"], imageP_decoder_self_attention_bias=cache["imageP_decoder_self_attention_bias"])
 
       with tf.variable_scope(target_modality.name):
         logits = target_modality.top_sharded(body_outputs, None, dp)[0]
@@ -312,8 +332,17 @@ class Transformer(t2t_model.T2TModel):
       cache[layer]["k"]._shape = tf.TensorShape([None, None, key_channels])
       cache[layer]["v"]._shape = tf.TensorShape([None, None, value_channels])
     # pylint: enable=protected-access
+    
+    # get image attention bias for decoder
+    img_encoder_padding = common_attention.embedding_to_padding(imageP)
+    imageP_decoder_self_attention_bias = common_attention.attention_bias_ignore_padding(img_encoder_padding)
+    
     cache["encoder_output"] = encoder_output
     cache["encoder_decoder_attention_bias"] = encoder_decoder_attention_bias
+     
+    #get images to cache for input to decoder
+    cache["imageP"] = imageP
+    cache["imageP_decoder_self_attention_bias"] = imageP_decoder_self_attention_bias
 
     if beam_size > 1:  # Beam Search
       target_modality = (
@@ -440,7 +469,7 @@ def transformer_prepare_decoder(targets, hparams):
 def transformer_encoder(encoder_input,
                         encoder_self_attention_bias,
                         hparams,
-                        name="encoder"):
+                        name="encoder", imageP=None):
   """A stack of transformer layers.
 
   Args:
@@ -483,7 +512,14 @@ def transformer_encoder(encoder_input,
     # if normalization is done in layer_preprocess, then it shuold also be done
     # on the output, since the output can grow very large, being the sum of
     # a whole stack of unnormalized layer outputs.
-    return common_layers.layer_preprocess(x, hparams)
+    encoder_output = common_layers.layer_preprocess(x, hparams)
+    #JI: adding image information to the encoder output
+    if imageP is not None:  
+      with tf.variable_scope(name):
+        W1 = tf.layers.dense(imageP, 1024, use_bias=False, name="image_proj")
+        encoder_output = tf.add(encoder_output, W1)
+    
+    return encoder_output
 
 
 def transformer_decoder(decoder_input,
@@ -492,7 +528,7 @@ def transformer_decoder(decoder_input,
                         encoder_decoder_attention_bias,
                         hparams,
                         cache=None,
-                        name="decoder"):
+                        name="decoder", imageP=None, imageP_decoder_self_attention_bias=None):
   """A stack of transformer layers.
 
   Args:
@@ -510,6 +546,21 @@ def transformer_decoder(decoder_input,
   Returns:
     y: a Tensors
   """
+  #JI: adding the image attention def 
+  def _vis_attn_unit(x):
+    with tf.variable_scope("trans_attention"):
+      preprocess_x = common_layers.layer_preprocess(x, hparams)
+      y = common_attention.multihead_attention(
+              preprocess_x,
+              imageP, imageP_decoder_self_attention_bias,
+              hparams.attention_key_channels or hparams.hidden_size,
+              hparams.attention_value_channels or hparams.hidden_size,
+              hparams.hidden_size, hparams.num_heads,
+              hparams.attention_dropout,
+              name="image_attention"
+          )
+      x = common_layers.layer_postprocess(x, y, hparams)
+    return x
   x = decoder_input
   with tf.variable_scope(name):
     for layer in xrange(hparams.num_decoder_layers or
@@ -542,6 +593,9 @@ def transformer_decoder(decoder_input,
                 hparams.hidden_size, hparams.num_heads,
                 hparams.attention_dropout)
             x = common_layers.layer_postprocess(x, y, hparams)
+       #JI: add the image attention 
+        if imageP is not None:
+          x = _vis_attn_unit(x)
         with tf.variable_scope("ffn"):
           y = transformer_ffn_layer(
               common_layers.layer_preprocess(x, hparams), hparams)
@@ -549,6 +603,8 @@ def transformer_decoder(decoder_input,
     # if normalization is done in layer_preprocess, then it shuold also be done
     # on the output, since the output can grow very large, being the sum of
     # a whole stack of unnormalized layer outputs.
+    #if imageP is not None:
+    #  return decoder_input, common_layers.layer_preprocess(x, hparams)
     return common_layers.layer_preprocess(x, hparams)
 
 
@@ -703,6 +759,7 @@ def transformer_big():
   hparams.filter_size = 4096
   hparams.num_heads = 16
   hparams.layer_prepostprocess_dropout = 0.3
+  hparams.add_hparam("update_delib_only", False)
   return hparams
 
 

@@ -7,37 +7,49 @@ from __future__ import print_function
 
 import os
 import sys
-
+import numpy as np
 import tensorflow as tf
+import struct
+
 
 from tensor2tensor.data_generators.translate import TranslateProblem
 from tensor2tensor.data_generators import problem
 from tensor2tensor.data_generators import text_encoder
 from tensor2tensor.utils import registry
 from tensor2tensor.models import transformer
-from six.moves import xrange  # pylint: disable=redefined-builtin
+
+from sklearn import decomposition
+from sklearn import datasets
+from sklearn.preprocessing import StandardScaler
 
 # Chinese to English translation datasets.
+LOCATION_OF_DATA = '/experiments/jive/multi30k/'
 
-LOCATION_OF_DATA = '/exps/jive/delibnet/en_de_NMT_train_dev/'
+
+#JI: first pass translation as produced by beam 10 (10 times training set)
+# source and target repeated 10 times, image vectors repeated one time (see hack below)
+
 _ZHEN_TRAIN_DATASETS = [
-    LOCATION_OF_DATA+'train.tok.src.en',
-    LOCATION_OF_DATA+'train.tok.pe',
-    LOCATION_OF_DATA+'train.tok.nmt'
+    LOCATION_OF_DATA+'train.rnd.delib.en',
+    LOCATION_OF_DATA+'train.rnd.delib.train.fr',
+    LOCATION_OF_DATA+'train.rnd.delib.firstpass.train.fr',
+    LOCATION_OF_DATA+'train.npy'
 ]
+
+_ZHEN_DEV_DATASETS = [
+    LOCATION_OF_DATA+'val.rnd.en',
+    LOCATION_OF_DATA+'val.fr',
+    LOCATION_OF_DATA+'val.frrndst24439.transformer.zhen_wmt17_transformer_big_v1.delib_zhen_wmt17.beam10.alpha1.0.decodes',
+    LOCATION_OF_DATA+'val.npy'
+]
+
 
 _ZHEN_STRAIN_DATASETS = [
 ]
 
-_ZHEN_DEV_DATASETS = [
-    LOCATION_OF_DATA+'dev.tok.src.en',
-    LOCATION_OF_DATA+'dev.tok.pe',
-    LOCATION_OF_DATA+'dev.tok.nmt'
-]
-
 _ZHEN_VOCAB_FILES = [
-    LOCATION_OF_DATA+'vocab.en',
-    LOCATION_OF_DATA+'vocab.de'
+    LOCATION_OF_DATA+'train_rnd_en.dict',
+    LOCATION_OF_DATA+'train_fr.dict'
 ]
 
 
@@ -70,7 +82,7 @@ def bi_vocabs_token2id_generator(source_path, target_path, source_token_vocab, t
                 yield {"inputs": source_ints, "targets": target_ints}
                 source, target = source_file.readline(), target_file.readline()
 
-def tri_vocabs_token2id_generator(source_path, target_path, firstP_path, source_token_vocab, target_token_vocab, eos=None):
+def tri_vocabs_token2id_generator(source_path, target_path, firstP_path, imageP_path, source_token_vocab, target_token_vocab, eos=None):
     """Generator for sequence-to-sequence tasks that uses tokens.
 
     This generator assumes the files at source_path and target_path have
@@ -94,22 +106,28 @@ def tri_vocabs_token2id_generator(source_path, target_path, firstP_path, source_
     with tf.gfile.GFile(source_path, mode="r") as source_file:
         with tf.gfile.GFile(target_path, mode="r") as target_file:
             with tf.gfile.GFile(firstP_path, mode="r") as firstP_file:
+                            
+                image_array = np.load(imageP_path)
                 source, target, firstP = source_file.readline(), target_file.readline(), firstP_file.readline()
+                counter = 0
                 while source and target and firstP:
                     source_ints = source_token_vocab.encode(source.strip()) + eos_list
                     target_ints = target_token_vocab.encode(target.strip()) + eos_list
                     firstP_ints = target_token_vocab.encode(firstP.strip()) + eos_list
-                    yield {"inputs": source_ints, "targets": target_ints, "firstP": firstP_ints}
+                    imageP = image_array[counter].flatten().tolist()
+                    #JI: hacky trick we input image vectors as the first element of the list not to change max input length of a sequence (this could be tricky) 
+                    imageP_ints = [np.array(imageP)]
+                    yield {"inputs": source_ints, "targets": target_ints, "firstP": firstP_ints, "imageP": imageP_ints}
                     source, target, firstP = source_file.readline(), target_file.readline(), firstP_file.readline()
+                    counter+=1
+                    #JI: hack to repeat image for beam 10 sampled first pass translation
+                    if counter == 29000:
+                        counter=0
 
-@registry.register_problem("delibXnets_zhen")
-class DelibXNetsZhenWmt17(TranslateProblem):
+@registry.register_problem
+class DelibZhenWmt17(TranslateProblem):
     """Problem spec for WMT17 Zh-En translation."""
-   
-    @property
-    def num_basemodel(self):
-        return 2
-    
+
     @property
     def targeted_vocab_size(self):
         return 40000 - 1 # subtract for compensation
@@ -120,11 +138,11 @@ class DelibXNetsZhenWmt17(TranslateProblem):
 
     @property
     def source_vocab_name(self):
-        return "vocab.zh"
+        return "train_rnd_en.dict"
 
     @property
     def target_vocab_name(self):
-        return "vocab.en"
+        return "train_fr.dict"
 
     @property
     def input_space_id(self):
@@ -154,13 +172,13 @@ class DelibXNetsZhenWmt17(TranslateProblem):
         print('Done')
         
         # Truncate the vocabulary depending on the given size (strip the reserved tokens).
-        vocab_src_list = vocab_src_list[3:self.targeted_vocab_size+1]
-        vocab_trg_list = vocab_trg_list[3:self.targeted_vocab_size+1]
+        #vocab_src_list = vocab_src_list[3:self.targeted_vocab_size+1]
+        #vocab_trg_list = vocab_trg_list[3:self.targeted_vocab_size+1]
     
         # Insert the <UNK>.
-        vocab_src_list.insert(0, "<UNK>")
-        vocab_trg_list.insert(0, "<UNK>")
-    
+        #vocab_src_list.insert(0, "<UNK>")
+        #vocab_trg_list.insert(0, "<UNK>")    
+
         # Auto-insert the reserved tokens as: <pad>=0 <EOS>=1 and <UNK>=2.
         source_vocab = text_encoder.TokenTextEncoder(vocab_filename=None, vocab_list=vocab_src_list,
                                                      replace_oov="<UNK>", num_reserved_ids=text_encoder.NUM_RESERVED_TOKENS)
@@ -171,19 +189,19 @@ class DelibXNetsZhenWmt17(TranslateProblem):
         datapath = _ZHEN_TRAIN_DATASETS if train else _ZHEN_DEV_DATASETS
         
         # Build a generator.
-        return bi_vocabs_token2id_generator(datapath[0], datapath[1], source_vocab, target_vocab, text_encoder.EOS_ID)
+        #return bi_vocabs_token2id_generator(datapath[0], datapath[1], source_vocab, target_vocab, text_encoder.EOS_ID)
+        return tri_vocabs_token2id_generator(datapath[0], datapath[1], datapath[2], datapath[3], source_vocab, target_vocab, text_encoder.EOS_ID)
     
     
     def example_reading_spec(self):
+      
+      #JI: specify the shape of image vectors
       data_fields = {
         "inputs": tf.VarLenFeature(tf.int64),
-        "targets": tf.VarLenFeature(tf.int64)
+        "targets": tf.VarLenFeature(tf.int64),
+        "firstP": tf.VarLenFeature(tf.int64),
+        "imageP": tf.FixedLenFeature([1, 19600], tf.float32)
       }
-      
-      data_fields.update({
-        "firstP_" + str(ii): tf.VarLenFeature(tf.int64)
-        for ii in xrange(self.num_basemodel)
-      })
       
       data_items_to_decoders = None
       return (data_fields, data_items_to_decoders)
@@ -202,14 +220,14 @@ class DelibXNetsZhenWmt17(TranslateProblem):
         with open(_ZHEN_VOCAB_FILES[1], 'rb') as f:
             vocab_trg_list = f.read().decode('utf8', 'ignore').splitlines()
         tf.logging.info("Done")
-    
+        
         # Truncate the vocabulary depending on the given size (strip the reserved tokens).
-        vocab_src_list = vocab_src_list[3:self.targeted_vocab_size+1]
-        vocab_trg_list = vocab_trg_list[3:self.targeted_vocab_size+1]
-    
+        #vocab_src_list = vocab_src_list[3:self.targeted_vocab_size+1]
+        #vocab_trg_list = vocab_trg_list[3:self.targeted_vocab_size+1]        
+
         # Insert the <UNK>.
-        vocab_src_list.insert(0, "<UNK>")
-        vocab_trg_list.insert(0, "<UNK>")
+        #vocab_src_list.insert(0, "<UNK>")
+        #vocab_trg_list.insert(0, "<UNK>")
     
         # Auto-insert the reserved tokens as: <pad>=0 <EOS>=1 and <UNK>=2.
         source_encoder = text_encoder.TokenTextEncoder(vocab_filename=None, vocab_list=vocab_src_list, replace_oov="<UNK>", 
@@ -226,32 +244,55 @@ class DelibXNetsZhenWmt17(TranslateProblem):
         target_vocab_size = self._encoders["targets"].vocab_size
         if self.has_inputs:
             source_vocab_size = self._encoders["inputs"].vocab_size
+            #JI: set input modality to generic
             p.input_modality = {
               "inputs": (registry.Modalities.SYMBOL, source_vocab_size),
+              "firstP": (registry.Modalities.SYMBOL, target_vocab_size),
+              "imageP": (registry.Modalities.GENERIC, None)
             }
-            p.input_modality.update({
-              "firstP_"+str(i): (registry.Modalities.SYMBOL, target_vocab_size)
-              for i in xrange(self.num_basemodel)
-            })
-            
+        
         p.target_modality = (registry.Modalities.SYMBOL, target_vocab_size)
         if self.has_inputs:
             p.input_space_id = self.input_space_id
         p.target_space_id = self.target_space_id
         if self.is_character_level:
             p.loss_multiplier = 2.0
-   
-
-@registry.register_hparams
-def transformer_delibXnet_big():
-    """HParams for transfomer big delibnet model on WMT."""
-    hparams = transformer.transformer_big()
-    hparams.add_hparam("delib_layers", "")
-    hparams.add_hparam("update_delib_only", True)
-    hparams.add_hparam("m_basemodel", 2)
-    hparams.shared_embedding_and_softmax_weights = int(False)
-    return hparams
-
-
     
 
+@registry.register_hparams
+def zhen_wmt17_transformer_big_v1():
+    
+    hparams = transformer.transformer_base_v1()
+    hparams.hidden_size = 1024
+    hparams.filter_size = 4096
+    hparams.num_heads = 16
+    # hparams.batching_mantissa_bits = 2
+    hparams.learning_rate = 0.05
+    hparams.layer_prepostprocess_dropout = 0.1
+    hparams.learning_rate_warmup_steps = 8000
+    hparams.add_hparam("update_delib_only", False)
+    #hparams.add_hparam("init_checkpoint", "/experiments/jive/mm-en-de-trans-gaps/model.ckpt-127678")
+    return hparams
+    
+
+@registry.register_hparams
+def transformer_delib_big_v2():
+    """HParams for transfomer big delibnet model on WMT."""
+    hparams = transformer.transformer_base_v1()
+    hparams.hidden_size = 1024
+    hparams.filter_size = 4096
+    hparams.num_heads = 16
+    # hparams.batching_mantissa_bits = 2
+    hparams.learning_rate = 0.05
+    hparams.layer_prepostprocess_dropout = 0.1
+    hparams.learning_rate_warmup_steps = 8000
+    
+    #hparams = transformer.transformer_big()
+    hparams.add_hparam("delib_layers", "0;1;2")
+    #hparams.num_hidden_layers = 6
+    hparams.add_hparam("update_delib_only", False)
+    #JI: for delib specify checkpoint with pre-trained weights; check tensor2tensor/utils/model_builder.py and uncomment weight initialization
+    hparams.add_hparam("init_checkpoint", "/experiments/jive/mm-en-fr-trans-rnd/model.ckpt-24439")
+    hparams.shared_embedding_and_softmax_weights = int(False)
+    
+    return hparams

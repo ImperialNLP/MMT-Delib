@@ -200,7 +200,7 @@ def decode_from_dataset(estimator,
     tf.logging.info("Completed inference on %d samples." % num_predictions)  # pylint: disable=undefined-loop-variable
 
 
-def decode_from_file(estimator, filename, firstPfile, decode_hp, decode_to_file=None):
+def decode_from_file(estimator, filename, firstPfile, imagePfile, decode_hp, decode_to_file=None, img_idx=None):
   """Compute predictions on entries in filename and write them out."""
   if not decode_hp.batch_size:
     decode_hp.batch_size = 32
@@ -217,13 +217,13 @@ def decode_from_file(estimator, filename, firstPfile, decode_hp, decode_to_file=
   targets_vocab = hparams.problems[problem_id].vocabulary["targets"]
   problem_name = FLAGS.problems.split("-")[problem_id]
   tf.logging.info("Performing decoding from a file.")
-  sorted_inputs, sorted_firstP, sorted_keys = _get_sorted_inputs(
-      filename, firstPfile, decode_hp.shards, decode_hp.delimiter)
+  sorted_inputs, sorted_firstP, sorted_imageP, sorted_keys = _get_sorted_inputs(
+      filename, firstPfile, imagePfile, decode_hp.shards, decode_hp.delimiter,img_idx=img_idx)
   num_decode_batches = (len(sorted_inputs) - 1) // decode_hp.batch_size + 1
 
   def input_fn():
     input_gen = _decode_batch_input_fn(
-        problem_id, num_decode_batches, sorted_inputs, sorted_firstP, inputs_vocab, targets_vocab,
+        problem_id, num_decode_batches, sorted_inputs, sorted_firstP, sorted_imageP, inputs_vocab, targets_vocab,
         decode_hp.batch_size, decode_hp.max_input_size)
     gen_fn = make_input_fn_from_generator(input_gen)
     example = gen_fn()
@@ -340,7 +340,7 @@ def decode_interactively(estimator, decode_hp):
 
 
 def _decode_batch_input_fn(problem_id, num_decode_batches,
-                           sorted_inputs, sorted_firstP,
+                           sorted_inputs, sorted_firstP, sorted_imageP,
                            vocabulary, vocabulary_trg,
                            batch_size, max_input_size):
   tf.logging.info(" batch %d" % num_decode_batches)
@@ -348,39 +348,51 @@ def _decode_batch_input_fn(problem_id, num_decode_batches,
   # you'll see it in the first batch
   sorted_inputs.reverse()
   sorted_firstP.reverse()
+  sorted_imageP.reverse()
   for b in range(num_decode_batches):
     tf.logging.info("Decoding batch %d" % b)
-    batch_length, batch_firstP_length = 0, 0
-    batch_inputs, batch_firstP = [], []
+    batch_length, batch_firstP_length, batch_imageP_length = 0, 0, 0
+    batch_inputs, batch_firstP, batch_imageP = [], [], []
     curr_batch_inputs = sorted_inputs[b*batch_size : (b+1)*batch_size]
     curr_batch_firstP = sorted_firstP[b*batch_size : (b+1)*batch_size]
+    curr_batch_imageP = sorted_imageP[b*batch_size : (b+1)*batch_size]
 
-    for (inputs, firstP) in zip(curr_batch_inputs, curr_batch_firstP):
+    for (inputs, firstP, imageP) in zip(curr_batch_inputs, curr_batch_firstP, curr_batch_imageP):
       input_ids = vocabulary.encode(inputs)
       firstP_ids = vocabulary_trg.encode(firstP)
+      imageP_ids = imageP
       if max_input_size > 0:
         # Subtract 1 for the EOS_ID.
         input_ids = input_ids[:max_input_size - 1]
         firstP_ids = firstP_ids[:max_input_size - 1]
+        imageP_ids = imageP_ids[:max_input_size]
       input_ids.append(text_encoder.EOS_ID)
       batch_inputs.append(input_ids)
       firstP_ids.append(text_encoder.EOS_ID)
       batch_firstP.append(firstP_ids)
+      batch_imageP.append(imageP_ids)
       if len(input_ids) > batch_length:
         batch_length = len(input_ids)
       if len(firstP_ids) > batch_firstP_length:
         batch_firstP_length = len(firstP_ids)
+      if len(imageP_ids) > batch_imageP_length:
+        batch_imageP_length = len(imageP_ids)
+
     final_batch_inputs = []
     final_batch_firstP = []
-    for (input_ids, firstP_ids) in zip(batch_inputs, batch_firstP):
+    final_batch_imageP = []
+    for (input_ids, firstP_ids, imageP_ids) in zip(batch_inputs, batch_firstP, batch_imageP):
       assert len(input_ids) <= batch_length
       assert len(firstP_ids) <= batch_firstP_length
+      assert len(imageP_ids) <= batch_imageP_length
       x = input_ids + [0] * (batch_length - len(input_ids))
       final_batch_inputs.append(x)
       final_batch_firstP.append(firstP_ids + [0] * (batch_firstP_length - len(firstP_ids)))
+      final_batch_imageP.append(imageP_ids + [0] * (batch_imageP_length - len(imageP_ids)))
     yield {
         "inputs": np.array(final_batch_inputs).astype(np.int32),
         "firstP": np.array(final_batch_firstP).astype(np.int32),
+        "imageP": np.array(final_batch_imageP).astype(np.float32),
         "problem_choice": np.array(problem_id).astype(np.int32),
     }
 
@@ -503,7 +515,7 @@ def show_and_save_image(img, save_path):
   plt.savefig(save_path)
 
 
-def _get_sorted_inputs(filename, firstPfilename, num_shards=1, delimiter="\n"):
+def _get_sorted_inputs(filename, firstPfilename, imagePfilename, num_shards=1, delimiter="\n", img_idx=None):
   """Returning inputs sorted according to length.
 
   Args:
@@ -522,9 +534,11 @@ def _get_sorted_inputs(filename, firstPfilename, num_shards=1, delimiter="\n"):
   if num_shards > 1:
     decode_filename = filename + ("%.2d" % FLAGS.worker_id)
     firstP_filename = firstPfilename + ("%.2d" % FLAGS.worker_id)
+    imageP_filename = imagePfilename + ("%.2d" % FLAGS.worker_id)
   else:
     decode_filename = filename
     firstP_filename = firstPfilename
+    imageP_filename = imagePfilename
 
   with tf.gfile.Open(decode_filename) as f_input:
     with tf.gfile.Open(firstP_filename) as f_firstP:
@@ -534,21 +548,29 @@ def _get_sorted_inputs(filename, firstPfilename, num_shards=1, delimiter="\n"):
       records_firstP = text_firstP.split(delimiter)
       inputs = [record.strip() for record in records]
       firstP = [record.strip() for record in records_firstP]
-      # Strip the last empty line.
+      #JI: get image vectors according to indices 
+      image_idx_file = [int(line.rstrip('\n')) for line in open(img_idx)]
+      image_vs = np.load(imageP_filename)
+      imageP = []
+      for i in image_idx_file:
+        imageP.append(image_vs[i].flatten().tolist())
+      # Strip the last empty line
+      
       if not inputs[-1] or not firstP[-1]:
         inputs.pop()
         firstP.pop()
-
+      
   input_lens = [(i, len(line.split())) for i, line in enumerate(inputs)]
   sorted_input_lens = sorted(input_lens, key=operator.itemgetter(1))
   # We'll need the keys to rearrange the inputs back into their original order
   sorted_keys = {}
-  sorted_inputs, sorted_firstP = [], []
+  sorted_inputs, sorted_firstP, sorted_imageP = [], [], []
   for i, (index, _) in enumerate(sorted_input_lens):
     sorted_inputs.append(inputs[index])
     sorted_firstP.append(firstP[index])
+    sorted_imageP.append(imageP[index])
     sorted_keys[index] = i
-  return sorted_inputs, sorted_firstP, sorted_keys
+  return sorted_inputs, sorted_firstP, sorted_imageP, sorted_keys
 
 
 def _save_until_eos(hyp, is_image):
@@ -623,20 +645,22 @@ def _decode_input_tensor_to_features_dict(feature_map, hparams):
   """
   inputs = tf.convert_to_tensor(feature_map["inputs"])
   firstP = tf.convert_to_tensor(feature_map["firstP"])
+  imageP = tf.convert_to_tensor(feature_map["imageP"]) 
   input_is_image = False
 
-  def input_fn(problem_choice, x=inputs, z=firstP):  # pylint: disable=missing-docstring
+  def input_fn(problem_choice, x=inputs, z=firstP, t=imageP):  # pylint: disable=missing-docstring
     p_hparams = hparams.problems[problem_choice]
     # Add a third empty dimension dimension
     x = tf.expand_dims(x, axis=[2])
     x = tf.to_int32(x)
     z = tf.expand_dims(z, axis=[2])
     z = tf.to_int32(z)
+    t = tf.to_float(t)
 
     return (tf.constant(p_hparams.input_space_id),
-            tf.constant(p_hparams.target_space_id), x, z)
+            tf.constant(p_hparams.target_space_id), x, z, t)
 
-  input_space_id, target_space_id, x, z = input_fn_builder.cond_on_index(
+  input_space_id, target_space_id, x, z, t = input_fn_builder.cond_on_index(
       input_fn, feature_map["problem_choice"], len(hparams.problems) - 1)
 
   features = {}
@@ -647,4 +671,6 @@ def _decode_input_tensor_to_features_dict(feature_map, hparams):
       IMAGE_DECODE_LENGTH if input_is_image else tf.shape(x)[1] + 50)
   features["inputs"] = x
   features["firstP"] = z
+  features["imageP"] = t
+  print(t.shape)
   return features

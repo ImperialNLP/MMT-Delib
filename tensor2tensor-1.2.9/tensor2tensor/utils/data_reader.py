@@ -106,13 +106,16 @@ def input_pipeline(problem,
         hparams=hparams,
         dataset_split=dataset_split,
         shard=shard)
+    #dataset = dataset.map(cast_int64_to_int32, num_parallel_calls=num_threads)
     dataset = dataset.map(cast_int64_to_int32, num_threads=num_threads)
+          
     dataset = dataset.filter(
         functools.partial(
             example_valid_size,
             min_length=batching_scheme["min_length"],
             max_length=batching_scheme["max_length"],
         ))
+    
     if is_training:
       dataset = dataset.shuffle(capacity)
       dataset = dataset.repeat(None)
@@ -147,6 +150,9 @@ def _example_length(example):
   # Length of the example is the maximum length of the feature lengths
   for v in example.values():
     # For images the sequence length is the size of the spatial dimensions.
+    if len(v.get_shape())==0:
+      continue
+    print(v.get_shape())
     feature_length = (tf.shape(v)[0] if len(v.get_shape()) < 3 else
                       tf.shape(v)[0] * tf.shape(v)[1])
     length = tf.maximum(length, feature_length)

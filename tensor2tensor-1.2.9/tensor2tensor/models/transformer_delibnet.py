@@ -40,6 +40,9 @@ from .transformer import transformer_decoder, transformer_prepare_decoder, trans
 import tensorflow as tf
 
 from tensorflow.python.util import nest
+global img_dim
+img_dim = 196
+
 
 @registry.register_model
 class Transformer_Delib(Transformer):
@@ -61,18 +64,25 @@ class Transformer_Delib(Transformer):
 
     return (firstPdecoder_input, firstP_delib_attention_bias)
 
+
   def model_fn_body(self, features):
+   
     hparams = self._hparams
     inputs = features.get("inputs")
     firstP = features.get("firstP")
     firstP = common_layers.flatten4d3d(firstP)
     targets = features["targets"]
     targets = common_layers.flatten4d3d(targets)
-
+    #JI: set image dimensions
+    imageP = features.get("imageP")
+    imageP.set_shape([None, 1, 19600])
+    imageP=tf.reshape(imageP,[-1, img_dim, 100])  
+    
     encoder_output, encoder_decoder_attention_bias = (None, None)
     if inputs is not None:
       target_space = features["target_space_id"]
-      encoder_output, encoder_decoder_attention_bias = self.encode(inputs, target_space, hparams)
+      #JI: if needed pass images to encoder
+      encoder_output, encoder_decoder_attention_bias = self.encode(inputs, target_space, hparams, imageP=None)
 
     # used to extract hidden states
     (decoder_input, decoder_self_attention_bias) = transformer_prepare_decoder(firstP, hparams)
@@ -80,7 +90,7 @@ class Transformer_Delib(Transformer):
     (delibdecoder_input, delibdecoder_self_attention_bias) = transformer_prepare_decoder(targets, hparams)
     # the `delibctx` used for the second-pass decoder
     firstP_input, firstP_self_attention_bias = self.transformer_prepare_delibdecoder(firstP, hparams)
-
+    
     # add dropout to the two decoders
     decoder_input = tf.nn.dropout(decoder_input, 1.0 - hparams.layer_prepostprocess_dropout)
     delibdecoder_input = tf.nn.dropout(delibdecoder_input, 1.0 - hparams.layer_prepostprocess_dropout)
@@ -91,12 +101,17 @@ class Transformer_Delib(Transformer):
                                          encoder_decoder_attention_bias,
                                          hparams,
                                          cache=None)
-
+    
     firstP_input = tf.concat(values=[firstP_input, decoder_output], axis=-1)
+    
+    #JI: get biases for image attention
+    img_encoder_padding = common_attention.embedding_to_padding(imageP)
+    imageP_self_attention_bias = common_attention.attention_bias_ignore_padding(img_encoder_padding)
 
+    #JI: pass images to the decoder
     delibdecoder_output = transformer_delibdecoder(
-        delibdecoder_input, encoder_output, firstP_input,
-        delibdecoder_self_attention_bias, encoder_decoder_attention_bias, firstP_self_attention_bias,
+        delibdecoder_input, encoder_output, firstP_input, imageP,
+        delibdecoder_self_attention_bias, encoder_decoder_attention_bias, firstP_self_attention_bias, imageP_self_attention_bias,
         hparams, cache=None, name="delib_decoder")
     return delibdecoder_output
 
@@ -132,6 +147,12 @@ class Transformer_Delib(Transformer):
 
     inputs = features["inputs"]
     firstP = features["firstP"]
+    imageP = features["imageP"]
+    
+    #JI: set image shapes
+    imageP.set_shape([None, 27250])
+    imageP=tf.reshape(imageP,[-1, img_dim, 50])
+    
     batch_size = tf.shape(inputs)[0]
     target_modality = self._problem_hparams.target_modality
     if t2t_model.is_class_modality(target_modality):
@@ -161,8 +182,9 @@ class Transformer_Delib(Transformer):
     with tf.variable_scope(input_modality.name):
         inputs = input_modality.bottom_sharded(inputs, dp)
     with tf.variable_scope("body"):
+        #JI: pass images to encoder if needed
         encoder_output, encoder_decoder_attention_bias = dp(
-            self.encode, inputs, features["target_space_id"], hparams)
+            self.encode, inputs, features["target_space_id"], hparams, imageP=imageP)
     encoder_output = encoder_output[0]
     encoder_decoder_attention_bias = encoder_decoder_attention_bias[0]
 
@@ -187,6 +209,11 @@ class Transformer_Delib(Transformer):
 
     if hparams.pos == "timing":
       timing_signal = common_attention.get_timing_signal_1d(decode_length + 1, hparams.hidden_size)
+    
+    #JI: get visual attention bias
+    img_encoder_padding = common_attention.embedding_to_padding(imageP)
+    imageP_self_attention_bias = common_attention.attention_bias_ignore_padding(img_encoder_padding)
+    
 
     def preprocess_targets(targets, i):
         """Performs preprocessing steps on the targets to prepare for the decoder.
@@ -252,7 +279,10 @@ class Transformer_Delib(Transformer):
     firstP_input = tf.concat(values=[firstP, firstP_hidden[0]], axis=-1)
     cache["firstP_input"] = firstP_input
     cache["firstP_self_attention_bias"] = firstP_delib_attention_bias
-
+    #JI: add image info to cache
+    cache["imageP"] = imageP
+    cache["imageP_self_attention_bias"] = imageP_self_attention_bias
+   
     def symbols_to_logits_fn(ids, i, cache):
         """Go from ids to logits for next symbol."""
         ids = ids[:, -1:]
@@ -262,10 +292,11 @@ class Transformer_Delib(Transformer):
         bias = decoder_self_attention_bias[:, :, i:i + 1, :i + 1]
 
         with tf.variable_scope("body"):
+            #JI: pass image info to decoder
             body_outputs = dp(transformer_delibdecoder,
-                targets, cache["encoder_output"], cache["firstP_input"],
+                targets, cache["encoder_output"], cache["firstP_input"], cache["imageP"],
                 bias, cache["encoder_decoder_attention_bias"],
-                cache["firstP_self_attention_bias"], hparams, cache)
+                cache["firstP_self_attention_bias"], cache["imageP_self_attention_bias"], hparams, cache)
 
         with tf.variable_scope(target_modality.name):
             logits = target_modality.top_sharded(body_outputs, None, dp)[0]
@@ -318,10 +349,11 @@ class Transformer_Delib(Transformer):
 
 def transformer_delibdecoder(decoder_input,
                              encoder_output,
-                             firstP_input,
+                             firstP_input, imageP_input,
                              decoder_self_attention_bias,
                              encoder_decoder_attention_bias,
                              firstP_self_attention_bias,
+                             imageP_self_attention_bias,
                              hparams,
                              cache=None,
                              name="delib_decoder"):
@@ -385,6 +417,21 @@ def transformer_delibdecoder(decoder_input,
       x = common_layers.layer_postprocess(x, y, hparams)
       return x
 
+  def _vis_attn_unit(x):
+    with tf.variable_scope("delibctx_attention"):
+      preprocess_x = common_layers.layer_preprocess(x, hparams)
+      y = common_attention.multihead_attention(
+              preprocess_x,
+              imageP_input, imageP_self_attention_bias,
+              hparams.attention_key_channels or hparams.hidden_size,
+              hparams.attention_value_channels or hparams.hidden_size,
+              hparams.hidden_size, hparams.num_heads,
+              hparams.attention_dropout,
+              name="image_attention"
+          )
+      x = common_layers.layer_postprocess(x, y, hparams)
+      return x
+
   if hparams.delib_layers is "":
     delib_layers = range(hparams.num_hidden_layers)
   else:
@@ -416,6 +463,8 @@ def transformer_delibdecoder(decoder_input,
           x = _two_attn_unit(x)
         else:
           x = _one_attn_unit(x)
+        #JI: adding the visual attention layer
+        x = _vis_attn_unit(x)
         with tf.variable_scope("ffn"):
           y = transformer_ffn_layer(
               common_layers.layer_preprocess(x, hparams), hparams)

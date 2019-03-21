@@ -49,6 +49,8 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string("output_dir", "", "Training directory to load from.")
 flags.DEFINE_string("decode_from_file", None, "Path to decode file")
 flags.DEFINE_string("decode_from_file_firstP", None, "Path to decode firstP file")
+flags.DEFINE_string("decode_from_file_imageP", None, "Path to decode imageP file")
+flags.DEFINE_string("decode_from_file_imageP_idx", None, "Path to decode imageP idx  file")
 flags.DEFINE_string("decode_to_file", None,
                     "Path prefix to inference output file")
 flags.DEFINE_bool("decode_interactive", False,
@@ -90,8 +92,9 @@ def main(_):
     decoding.decode_interactively(estimator, decode_hp)
   elif FLAGS.decode_from_file:
     assert FLAGS.decode_from_file_firstP is not None
-    decoding.decode_from_file(estimator, FLAGS.decode_from_file, FLAGS.decode_from_file_firstP,
-                              decode_hp, FLAGS.decode_to_file)
+    #assert FLAGS.decode_from_file_imageP is not None
+    decoding.decode_from_file(estimator, FLAGS.decode_from_file, FLAGS.decode_from_file_firstP, FLAGS.decode_from_file_imageP,
+                              decode_hp, FLAGS.decode_to_file, img_idx=FLAGS.decode_from_file_imageP_idx)
   else:
     decoding.decode_from_dataset(
         estimator,

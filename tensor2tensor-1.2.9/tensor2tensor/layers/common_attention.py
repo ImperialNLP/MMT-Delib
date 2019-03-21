@@ -1172,7 +1172,10 @@ def dot_product_attention(q,
     logits = tf.matmul(q, k, transpose_b=True)
     if bias is not None:
       logits += bias
+    #logits = tf.Print(logits,[logits, tf.shape(logits)], message='attimage', summarize=1024)
     weights = tf.nn.softmax(logits, name="attention_weights")
+    #print(weights.get_shape().as_list())
+    #weights = tf.Print(weights,[weights, tf.shape(weights)], message='attimage', summarize=1024)
     # dropping out the attention links for each of the heads
     weights = tf.nn.dropout(weights, 1.0 - dropout_rate)
     if (not tf.get_variable_scope().reuse and

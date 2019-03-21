@@ -25,7 +25,7 @@ import os
 import random
 import stat
 import tarfile
-
+import numpy as np
 # Dependency imports
 
 import requests
@@ -41,10 +41,15 @@ import tensorflow as tf
 UNSHUFFLED_SUFFIX = "-unshuffled"
 
 
+def float_feature(value):
+    return tf.train.Feature(float_list=tf.train.FloatList(value=value))
+
 def to_example(dictionary):
   """Helper: build tf.Example from (string -> int/float/str list) dictionary."""
   features = {}
+  #print(dictionary)
   for (k, v) in six.iteritems(dictionary):
+    #print(v)
     if not v:
       raise ValueError("Empty generated field: %s", str((k, v)))
     if isinstance(v[0], six.integer_types):
@@ -57,6 +62,8 @@ def to_example(dictionary):
       features[k] = tf.train.Feature(bytes_list=tf.train.BytesList(value=v))
     elif isinstance(v[0], bytes):
       features[k] = tf.train.Feature(bytes_list=tf.train.BytesList(value=v))
+    elif isinstance(v[0], np.ndarray):
+      features[k] = float_feature(v[0])      
     else:
       raise ValueError("Value for %s is not a recognized type; v: %s type: %s" %
                        (k, str(v[0]), str(type(v[0]))))
